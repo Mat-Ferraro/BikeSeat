@@ -74,9 +74,10 @@ Controls:
         Finds the dark inner opening, rotates it vertical, and sets the symmetry axis.
 
     Auto Extract Profile:
-        Uses the selected Profile target to create one mirrored side profile.
-        Inner dark opening traces the black opening.
-        Outer outside edge traces the outside chrome/body profile.
+        Uses the selected Algorithm to create one mirrored side profile.
+        Inside edge traces the black opening.
+        Silhouette traces a Photoshop/cutout object against a plain background.
+        Drawing traces architectural/catalog line drawings.
 
     Auto Break + Fit:
         Automatically picks breakpoints and fits exactly 8 circular arcs.
@@ -110,12 +111,14 @@ from matplotlib.figure import Figure
 
 ARC_COUNT = 8
 ARC_DISTRIBUTION_OPTIONS = [
+    "Top/bottom weighted",
     "Half above midpoint",
     "Half above widest point",
     "Unrestricted",
 ]
 DIMENSION_UNIT_OPTIONS = ["mm", "in"]
 ARC_SUMMARY_UNIT_OPTIONS = ["px", "mm", "in"]
+BOTTOM_MODE_OPTIONS = ["Auto", "Standard closed", "U-shaped bottom"]
 
 
 @dataclass
@@ -190,7 +193,7 @@ class AutoOrientationReport:
 
 @dataclass
 class AutoProfileReport:
-    target: str = "Inner dark opening"
+    target: str = "Inside edge"
     point_count: int = 0
     locked_manual_closures: bool = False
     edge_sensitivity: float = 0.28
@@ -207,7 +210,7 @@ class AutoProfileReport:
             [
                 "Auto Profile Extraction",
                 "=" * 32,
-                f"Target: {self.target}",
+                f"Algorithm: {self.target}",
                 f"Profile points: {self.point_count}",
                 f"Locked manual closures: {self.locked_manual_closures}",
                 f"Outer edge sensitivity: {self.edge_sensitivity:.3f}",
@@ -550,6 +553,22 @@ def pca_major_axis(points_xy: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.nd
     return center, major_axis, minor_axis
 
 
+def estimate_rotation_fill_color(image_pil: Image.Image, target: str) -> Tuple[int, int, int]:
+    """
+    Pick a good fill color for image rotations.
+
+    For Silhouette mode, the detector expects the image border to
+    represent the background. If rotation expands the canvas with white corners,
+    the border estimate becomes wrong for colored cutout backgrounds. Use the
+    current border/background color instead.
+    """
+    if target in ("Silhouette", "Drawing"):
+        bg_rgb = estimate_border_background_rgb(image_pil.convert("RGB"))
+        return tuple(int(max(0, min(255, round(value)))) for value in bg_rgb)
+
+    return (255, 255, 255)
+
+
 def rotate_image_pil(
     image_pil: Image.Image,
     angle_degrees: float,
@@ -625,6 +644,274 @@ def connected_components_4(mask: np.ndarray, min_area: int = 100) -> List[Dict]:
             )
 
     return components
+
+
+
+def connected_components_8(mask: np.ndarray, min_area: int = 100) -> List[Dict]:
+    """
+    8-connected component finder.
+
+    Architectural drawings often contain thin diagonal anti-aliased lines.
+    4-connectivity can split those lines into fragments, so drawing detection
+    uses 8-connectivity.
+    """
+    height, width = mask.shape
+    visited = np.zeros(mask.shape, dtype=bool)
+    components = []
+
+    ys_all, xs_all = np.where(mask)
+
+    for y_start, x_start in zip(ys_all, xs_all):
+        if visited[y_start, x_start] or not mask[y_start, x_start]:
+            continue
+
+        stack = [(int(x_start), int(y_start))]
+        visited[y_start, x_start] = True
+
+        xs = []
+        ys = []
+        touches_border = False
+
+        while stack:
+            x, y = stack.pop()
+            xs.append(x)
+            ys.append(y)
+
+            if x == 0 or y == 0 or x == width - 1 or y == height - 1:
+                touches_border = True
+
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dx == 0 and dy == 0:
+                        continue
+
+                    nx = x + dx
+                    ny = y + dy
+
+                    if nx < 0 or nx >= width or ny < 0 or ny >= height:
+                        continue
+
+                    if visited[ny, nx] or not mask[ny, nx]:
+                        continue
+
+                    visited[ny, nx] = True
+                    stack.append((nx, ny))
+
+        area = len(xs)
+
+        if area < min_area:
+            continue
+
+        components.append(
+            {
+                "area": area,
+                "xs": np.array(xs, dtype=np.float64),
+                "ys": np.array(ys, dtype=np.float64),
+                "touches_border": touches_border,
+            }
+        )
+
+    return components
+
+
+def score_drawing_outline_component(component: Dict, width: int, height: int, mask_kind: str) -> Tuple[float, Dict]:
+    """
+    Score linework components for architectural/profile drawings.
+
+    We want the profile outline, not dimension text, arrows, dashed boxes, or
+    border/crop artifacts.
+    """
+    xs = component["xs"]
+    ys = component["ys"]
+
+    area = float(component["area"])
+    x0 = float(np.min(xs))
+    x1 = float(np.max(xs))
+    y0 = float(np.min(ys))
+    y1 = float(np.max(ys))
+
+    bbox_width = max(x1 - x0 + 1.0, 1.0)
+    bbox_height = max(y1 - y0 + 1.0, 1.0)
+    bbox_area = bbox_width * bbox_height
+    fill_ratio = area / bbox_area
+
+    image_area = float(width * height)
+    area_fraction = area / max(image_area, 1.0)
+    bbox_area_fraction = bbox_area / max(image_area, 1.0)
+
+    centroid = np.array([float(xs.mean()), float(ys.mean())])
+    image_center = np.array([width / 2.0, height / 2.0])
+    diagonal = math.sqrt(width * width + height * height)
+    center_distance = float(np.linalg.norm(centroid - image_center)) / max(diagonal, 1.0)
+
+    # Basic size checks. Line drawings have low fill, so do not require a
+    # filled component.
+    if area < 80:
+        return -1.0, {}
+
+    if bbox_width < width * 0.08 or bbox_height < height * 0.08:
+        return -1.0, {}
+
+    # Very small bbox areas are usually text/symbols.
+    if bbox_area_fraction < 0.015:
+        return -1.0, {}
+
+    # Very high fill is not linework.
+    if fill_ratio > 0.55:
+        return -1.0, {}
+
+    # Huge full-canvas components touching borders are often dimension frames,
+    # axes, or crop artifacts. Penalize instead of hard reject, because some
+    # drawings are tightly cropped.
+    border_penalty = 0.18 if component["touches_border"] else 1.0
+
+    # Prefer central, large bounding boxes. The actual profile outline usually
+    # has the largest meaningful bbox, while text has smaller bboxes.
+    center_score = 1.0 / (1.0 + center_distance * 3.0)
+    bbox_score = bbox_area ** 0.75
+    area_score = area ** 0.55
+
+    # Magenta/pink linework often indicates the intentionally highlighted
+    # profile outline, so give it a strong preference when present.
+    kind_bonus = {
+        "magenta": 4.0,
+        "dark": 1.5,
+        "generic": 1.0,
+    }.get(mask_kind, 1.0)
+
+    # A profile outline should have a reasonably large height and width. This
+    # favors the contour over dimension numbers/arrows.
+    span_score = (min(bbox_width / max(width, 1), 1.0) + min(bbox_height / max(height, 1), 1.0)) / 2.0
+
+    score = bbox_score * area_score * center_score * border_penalty * kind_bonus * (0.5 + span_score)
+
+    metadata = {
+        "bbox": (x0, y0, x1, y1),
+        "bbox_width": bbox_width,
+        "bbox_height": bbox_height,
+        "bbox_area": bbox_area,
+        "fill_ratio": fill_ratio,
+        "area_fraction": area_fraction,
+        "bbox_area_fraction": bbox_area_fraction,
+        "centroid": centroid,
+        "center_distance": center_distance,
+        "mask_kind": mask_kind,
+    }
+
+    return score, metadata
+
+
+def find_main_drawing_outline_component(image_pil: Image.Image, max_dimension: int = 900) -> Dict:
+    """
+    Find the main profile outline in an architectural/catalog drawing.
+
+    This detector is for images with linework, not photos:
+      - magenta/pink highlighted outlines
+      - black outlines on white/gray
+      - drawings with dimension text/lines around the profile
+    """
+    image_rgb = image_pil.convert("RGB")
+    full_width, full_height = image_rgb.size
+
+    scale_down = max(full_width, full_height) / float(max_dimension)
+
+    if scale_down > 1.0:
+        small_width = max(1, int(round(full_width / scale_down)))
+        small_height = max(1, int(round(full_height / scale_down)))
+        image_small = image_rgb.resize((small_width, small_height), Image.Resampling.BILINEAR)
+    else:
+        image_small = image_rgb
+        scale_down = 1.0
+
+    arr = np.array(image_small.convert("RGB"), dtype=np.float64)
+    height, width, _ = arr.shape
+
+    r = arr[:, :, 0]
+    g = arr[:, :, 1]
+    b = arr[:, :, 2]
+    gray = 0.299 * r + 0.587 * g + 0.114 * b
+
+    bg_rgb = estimate_border_background_rgb(image_small)
+    bg_distance = np.linalg.norm(arr - bg_rgb, axis=2)
+
+    masks = []
+
+    # Highlighted magenta/pink profile outline. This intentionally ignores most
+    # green/red dimension lines.
+    magenta_mask = (
+        (r > 140.0)
+        & (b > 95.0)
+        & (g < 170.0)
+        & ((r - g) > 25.0)
+        & ((b - g) > 15.0)
+        & (bg_distance > 20.0)
+    )
+
+    if int(np.count_nonzero(magenta_mask)) >= 80:
+        masks.append(("magenta", magenta_mask, 40))
+
+    # Black/gray linework. This works for most catalog drawings.
+    dark_mask = (
+        (gray < 185.0)
+        & (bg_distance > 18.0)
+    )
+
+    if int(np.count_nonzero(dark_mask)) >= 80:
+        masks.append(("dark", dark_mask, 40))
+
+    # Generic non-background linework fallback.
+    generic_mask = bg_distance > max(25.0, float(np.percentile(bg_distance, 75.0)))
+
+    if int(np.count_nonzero(generic_mask)) >= 80:
+        masks.append(("generic", generic_mask, 40))
+
+    best_component = None
+    best_metadata = None
+    best_score = -1.0
+
+    for mask_kind, mask, min_area in masks:
+        components = connected_components_8(mask, min_area=min_area)
+
+        for component in components:
+            score, metadata = score_drawing_outline_component(component, width, height, mask_kind)
+
+            if score > best_score:
+                best_score = score
+                best_component = component
+                best_metadata = metadata
+
+    if best_component is None or best_score <= 0:
+        raise ValueError(
+            "Could not find a suitable drawing outline. Try cropping the drawing closer "
+            "to the profile, or use a drawing where the desired outline is dark/black "
+            "or highlighted in magenta/pink."
+        )
+
+    xs_full = best_component["xs"] * scale_down
+    ys_full = best_component["ys"] * scale_down
+    points_full = np.column_stack([xs_full, ys_full])
+
+    bbox_small = best_metadata["bbox"]
+    bbox_full = tuple(float(v * scale_down) for v in bbox_small)
+    centroid_full = best_metadata["centroid"] * scale_down
+
+    note = (
+        f"drawing outline detector; kind={best_metadata['mask_kind']}, "
+        f"fill={best_metadata['fill_ratio']:.4f}, "
+        f"bbox_fraction={best_metadata['bbox_area_fraction']:.4f}"
+    )
+
+    return {
+        "points_px": points_full,
+        "area_px": int(best_component["area"] * scale_down * scale_down),
+        "threshold": 0.0,
+        "scale_down": scale_down,
+        "score": float(best_score),
+        "touches_border": bool(best_component["touches_border"]),
+        "bbox_px": bbox_full,
+        "centroid_px": centroid_full,
+        "detector_note": note,
+    }
 
 
 def choose_strict_dark_thresholds(gray: np.ndarray) -> List[float]:
@@ -819,6 +1106,237 @@ def find_main_dark_component(image_pil: Image.Image, max_dimension: int = 750) -
     }
 
 
+
+def estimate_border_background_rgb(image_rgb: Image.Image) -> np.ndarray:
+    """
+    Estimate the background color from the image border.
+
+    This is especially useful for Photoshop cut-outs placed on a flat color
+    background. Median border color is robust against small specks/noise.
+    """
+    arr = np.array(image_rgb.convert("RGB"), dtype=np.float64)
+
+    border_pixels = np.concatenate(
+        [
+            arr[0, :, :],
+            arr[-1, :, :],
+            arr[:, 0, :],
+            arr[:, -1, :],
+        ],
+        axis=0,
+    )
+
+    return np.median(border_pixels, axis=0)
+
+
+def choose_foreground_distance_thresholds(distance: np.ndarray) -> List[float]:
+    """
+    Candidate thresholds for separating foreground from a mostly uniform
+    background.
+
+    We try several values because original photos and Photoshop cut-outs can
+    differ a lot. The component scorer picks the best plausible component.
+    """
+    percentiles = [55, 60, 65, 70, 75, 80, 85]
+    values = [float(np.percentile(distance, p)) for p in percentiles]
+
+    values.extend([18.0, 25.0, 35.0, 50.0, 70.0, 90.0, 120.0])
+
+    values = [v for v in values if 8.0 <= v <= 220.0]
+
+    return sorted(set(round(v, 3) for v in values))
+
+
+def score_foreground_component(component: Dict, width: int, height: int, threshold: float) -> Tuple[float, Dict]:
+    """
+    Score a candidate foreground/object silhouette component.
+    """
+    xs = component["xs"]
+    ys = component["ys"]
+
+    area = float(component["area"])
+
+    x0 = float(np.min(xs))
+    x1 = float(np.max(xs))
+    y0 = float(np.min(ys))
+    y1 = float(np.max(ys))
+
+    bbox_width = max(x1 - x0 + 1.0, 1.0)
+    bbox_height = max(y1 - y0 + 1.0, 1.0)
+    bbox_area = bbox_width * bbox_height
+    fill_ratio = area / bbox_area
+
+    image_area = float(width * height)
+    area_fraction = area / max(image_area, 1.0)
+
+    centroid = np.array([float(xs.mean()), float(ys.mean())])
+    image_center = np.array([width / 2.0, height / 2.0])
+    diagonal = math.sqrt(width * width + height * height)
+    center_distance = float(np.linalg.norm(centroid - image_center)) / max(diagonal, 1.0)
+
+    border_margin = min(x0, y0, width - 1.0 - x1, height - 1.0 - y1)
+    border_margin_fraction = border_margin / max(min(width, height), 1.0)
+
+    pts = np.column_stack([xs, ys])
+    elongation = 1.0
+
+    if len(pts) >= 3:
+        centered = pts - pts.mean(axis=0)
+        covariance = centered.T @ centered / max(len(pts) - 1, 1)
+        values, _ = np.linalg.eigh(covariance)
+        values = np.sort(values)
+
+        if values[0] > 1e-9:
+            elongation = math.sqrt(float(values[-1] / values[0]))
+
+    # Reject obvious noise.
+    if area_fraction < 0.01:
+        return -1.0, {}
+
+    # Reject full-image/background grabs. A silhouette can be big, but if it is
+    # most of the image, we probably thresholded the background.
+    if area_fraction > 0.82:
+        return -1.0, {}
+
+    if bbox_width < 30 or bbox_height < 30:
+        return -1.0, {}
+
+    # Prefer non-border components, but don't hard-reject border contact because
+    # some user crops may be tight. Penalize it instead.
+    border_penalty = 0.45 if component["touches_border"] else 1.0
+
+    # Prefer a component with enough fill to represent a solid object. Very low
+    # fill is likely a shadow/glare/edge fragment.
+    fill_score = max(min(fill_ratio, 1.0), 0.05)
+
+    # Prefer centered components.
+    center_score = 1.0 / (1.0 + center_distance * 3.0)
+
+    # Too-low thresholds can include shadows; too-high can erode the object.
+    threshold_score = 1.0 / (1.0 + abs(threshold - 70.0) / 120.0)
+
+    score = area
+    score *= fill_score ** 0.7
+    score *= center_score
+    score *= border_penalty
+    score *= threshold_score
+    score *= 1.0 + min(elongation, 5.0) * 0.08
+
+    metadata = {
+        "bbox": (x0, y0, x1, y1),
+        "bbox_width": bbox_width,
+        "bbox_height": bbox_height,
+        "bbox_area": bbox_area,
+        "fill_ratio": fill_ratio,
+        "centroid": centroid,
+        "center_distance": center_distance,
+        "border_margin_fraction": border_margin_fraction,
+        "elongation": elongation,
+        "area_fraction": area_fraction,
+        "threshold": threshold,
+    }
+
+    return score, metadata
+
+
+def find_main_foreground_component(image_pil: Image.Image, max_dimension: int = 750) -> Dict:
+    """
+    Find the main foreground object by separating it from the border background.
+
+    This is meant for Photoshop/cutout-style images where the seat/post is on a
+    flat or mostly uniform background. It is much better for tracing an outside
+    silhouette than the dark-opening detector.
+    """
+    image_rgb = image_pil.convert("RGB")
+    full_width, full_height = image_rgb.size
+
+    scale_down = max(full_width, full_height) / float(max_dimension)
+
+    if scale_down > 1.0:
+        small_width = max(1, int(round(full_width / scale_down)))
+        small_height = max(1, int(round(full_height / scale_down)))
+
+        image_small = image_rgb.resize(
+            (small_width, small_height),
+            Image.Resampling.BILINEAR
+        )
+    else:
+        image_small = image_rgb
+        scale_down = 1.0
+
+    arr = np.array(image_small.convert("RGB"), dtype=np.float64)
+    bg_rgb = estimate_border_background_rgb(image_small)
+    distance = np.linalg.norm(arr - bg_rgb, axis=2)
+
+    height, width = distance.shape
+    thresholds = choose_foreground_distance_thresholds(distance)
+
+    best_component = None
+    best_metadata = None
+    best_score = -1.0
+    best_threshold = None
+
+    for threshold in thresholds:
+        mask = distance > threshold
+        components = connected_components_4(mask, min_area=120)
+
+        for component in components:
+            score, metadata = score_foreground_component(component, width, height, threshold)
+
+            if score > best_score:
+                best_score = score
+                best_component = component
+                best_metadata = metadata
+                best_threshold = threshold
+
+    if best_component is None or best_score <= 0:
+        raise ValueError(
+            "Could not find a suitable foreground silhouette. For cut-outs, use a "
+            "plain background color, avoid shadows touching the border, and make sure "
+            "the object does not touch the image border."
+        )
+
+    xs_full = best_component["xs"] * scale_down
+    ys_full = best_component["ys"] * scale_down
+    points_full = np.column_stack([xs_full, ys_full])
+
+    bbox_small = best_metadata["bbox"]
+    bbox_full = tuple(float(v * scale_down) for v in bbox_small)
+    centroid_full = best_metadata["centroid"] * scale_down
+
+    note = (
+        f"foreground silhouette detector; bg_rgb={format_vector_2d(bg_rgb)}, "
+        f"fill={best_metadata['fill_ratio']:.3f}, "
+        f"area_fraction={best_metadata['area_fraction']:.3f}, "
+        f"elongation={best_metadata['elongation']:.3f}"
+    )
+
+    return {
+        "points_px": points_full,
+        "area_px": int(best_component["area"] * scale_down * scale_down),
+        "threshold": float(best_threshold),
+        "scale_down": scale_down,
+        "score": float(best_score),
+        "touches_border": bool(best_component["touches_border"]),
+        "bbox_px": bbox_full,
+        "centroid_px": centroid_full,
+        "detector_note": note,
+    }
+
+
+def find_component_for_target(image_pil: Image.Image, target: str) -> Dict:
+    """
+    Pick the right detector for the selected target mode.
+    """
+    if target == "Silhouette":
+        return find_main_foreground_component(image_pil)
+
+    if target == "Drawing":
+        return find_main_drawing_outline_component(image_pil)
+
+    return find_main_dark_component(image_pil)
+
+
 def estimate_axis_and_end_widths(points_px: np.ndarray) -> Dict:
     center, major_axis, minor_axis = pca_major_axis(points_px)
 
@@ -854,6 +1372,231 @@ def estimate_axis_and_end_widths(points_px: np.ndarray) -> Dict:
         "t_min": t_min,
         "t_max": t_max,
     }
+
+
+def weighted_average(values: np.ndarray, weights: np.ndarray) -> float:
+    values = np.asarray(values, dtype=float)
+    weights = np.asarray(weights, dtype=float)
+
+    total = float(np.sum(weights))
+
+    if total <= 1e-12:
+        return float(np.mean(values)) if len(values) else 0.0
+
+    return float(np.sum(values * weights) / total)
+
+
+def profile_axis_symmetry_score(points_px: np.ndarray, axis_unit: np.ndarray, bin_count: int = 72) -> Tuple[float, Dict]:
+    """
+    Score how well a proposed axis behaves like a mirror-symmetry axis.
+
+    For each slice along the candidate axis, we look at the left/right extents.
+    A good symmetry axis has the midpoint between left and right extents staying
+    near a constant value across many slices.
+    """
+    points = np.asarray(points_px, dtype=float)
+
+    if len(points) < 10:
+        return float("inf"), {}
+
+    axis_unit = np.asarray(axis_unit, dtype=float)
+    norm = float(np.linalg.norm(axis_unit))
+
+    if norm <= 1e-12:
+        return float("inf"), {}
+
+    axis_unit = axis_unit / norm
+    perp_unit = np.array([-axis_unit[1], axis_unit[0]], dtype=float)
+
+    center = points.mean(axis=0)
+
+    relative = points - center
+    t = relative @ axis_unit
+    q = relative @ perp_unit
+
+    t_min = float(np.min(t))
+    t_max = float(np.max(t))
+    q_range = max(float(np.percentile(q, 98.0) - np.percentile(q, 2.0)), 1.0)
+
+    if t_max <= t_min:
+        return float("inf"), {}
+
+    bins = np.linspace(t_min, t_max, bin_count + 1)
+
+    mids = []
+    widths = []
+    t_centers = []
+
+    for index in range(bin_count):
+        lo = bins[index]
+        hi = bins[index + 1]
+        mask = (t >= lo) & (t <= hi)
+
+        if int(np.count_nonzero(mask)) < 6:
+            continue
+
+        q_slice = q[mask]
+        q_low = float(np.percentile(q_slice, 2.0))
+        q_high = float(np.percentile(q_slice, 98.0))
+        width = max(q_high - q_low, 1e-9)
+
+        # Ignore tiny local fragments; they are often text/dimension artifacts.
+        if width < q_range * 0.08:
+            continue
+
+        mids.append((q_low + q_high) / 2.0)
+        widths.append(width)
+        t_centers.append((lo + hi) / 2.0)
+
+    if len(mids) < max(8, bin_count // 6):
+        return float("inf"), {}
+
+    mids = np.asarray(mids, dtype=float)
+    widths = np.asarray(widths, dtype=float)
+    t_centers = np.asarray(t_centers, dtype=float)
+
+    q_center = weighted_average(mids, widths)
+
+    residual = np.abs(mids - q_center)
+
+    # Normalize by profile width so scores are comparable across images.
+    symmetry_error = float(np.average(residual, weights=widths) / q_range)
+
+    coverage = (float(np.max(t_centers)) - float(np.min(t_centers))) / max(t_max - t_min, 1e-9)
+    coverage_penalty = 1.0 / max(coverage, 0.20)
+
+    score = symmetry_error * coverage_penalty
+
+    axis_center = center + perp_unit * q_center
+
+    metadata = {
+        "axis_unit": axis_unit,
+        "perp_unit": perp_unit,
+        "axis_center": axis_center,
+        "t_min": t_min,
+        "t_max": t_max,
+        "q_center": q_center,
+        "symmetry_error": symmetry_error,
+        "coverage": coverage,
+        "score": score,
+    }
+
+    return score, metadata
+
+
+def estimate_symmetry_axis_and_end_widths(points_px: np.ndarray) -> Dict:
+    """
+    Estimate the true mirror-symmetry axis for a seat-post profile.
+
+    This is now used for *all* targets (dark opening, foreground silhouette,
+    and drawing outline). The architectural drawing exposed the problem most
+    clearly, but the same mirror-symmetry rule is usually the correct rule for
+    ordinary seat-post photos as well.
+
+    Unlike the old PCA-only approach, this does not assume the longest direction
+    is always the correct vertical profile axis.
+    """
+    points = np.asarray(points_px, dtype=float)
+
+    if len(points) < 10:
+        return estimate_axis_and_end_widths(points)
+
+    center, pca_major, pca_minor = pca_major_axis(points)
+
+    candidate_angles = []
+
+    # Coarse search across all orientations.
+    candidate_angles.extend(float(angle) for angle in np.linspace(0.0, 180.0, 37, endpoint=False))
+
+    # Add PCA directions explicitly.
+    for axis in (pca_major, pca_minor):
+        angle = math.degrees(math.atan2(axis[1], axis[0])) % 180.0
+        candidate_angles.append(angle)
+
+    best_score = float("inf")
+    best_meta = None
+
+    for angle in candidate_angles:
+        radians = math.radians(angle)
+        axis_unit = np.array([math.cos(radians), math.sin(radians)], dtype=float)
+        score, metadata = profile_axis_symmetry_score(points, axis_unit)
+
+        if score < best_score:
+            best_score = score
+            best_meta = metadata
+
+    # Refine around the best angle.
+    if best_meta is not None:
+        best_angle = math.degrees(math.atan2(best_meta["axis_unit"][1], best_meta["axis_unit"][0])) % 180.0
+
+        for angle in np.linspace(best_angle - 7.5, best_angle + 7.5, 31):
+            radians = math.radians(angle)
+            axis_unit = np.array([math.cos(radians), math.sin(radians)], dtype=float)
+            score, metadata = profile_axis_symmetry_score(points, axis_unit)
+
+            if score < best_score:
+                best_score = score
+                best_meta = metadata
+
+    if best_meta is None or not np.isfinite(best_score):
+        return estimate_axis_and_end_widths(points)
+
+    axis_unit = np.asarray(best_meta["axis_unit"], dtype=float)
+    perp_unit = np.asarray(best_meta["perp_unit"], dtype=float)
+    axis_center = np.asarray(best_meta["axis_center"], dtype=float)
+
+    relative = points - axis_center
+    t = relative @ axis_unit
+    q = relative @ perp_unit
+
+    t_min = float(np.min(t))
+    t_max = float(np.max(t))
+
+    top_mask = t <= np.percentile(t, 15.0)
+    bottom_mask = t >= np.percentile(t, 85.0)
+
+    if int(np.count_nonzero(top_mask)) >= 4:
+        top_width = float(np.percentile(q[top_mask], 95.0) - np.percentile(q[top_mask], 5.0))
+    else:
+        top_width = 0.0
+
+    if int(np.count_nonzero(bottom_mask)) >= 4:
+        bottom_width = float(np.percentile(q[bottom_mask], 95.0) - np.percentile(q[bottom_mask], 5.0))
+    else:
+        bottom_width = 0.0
+
+    axis_top = axis_center + axis_unit * t_min
+    axis_bottom = axis_center + axis_unit * t_max
+
+    return {
+        "center": axis_center,
+        "major_axis": axis_unit,
+        "minor_axis": perp_unit,
+        "top_width": top_width,
+        "bottom_width": bottom_width,
+        "axis_top": axis_top,
+        "axis_bottom": axis_bottom,
+        "t_min": t_min,
+        "t_max": t_max,
+        "symmetry_error": float(best_meta.get("symmetry_error", 0.0)),
+        "symmetry_coverage": float(best_meta.get("coverage", 0.0)),
+    }
+
+
+
+
+def estimate_drawing_symmetry_axis_and_end_widths(points_px: np.ndarray) -> Dict:
+    """Backward-compatible alias."""
+    return estimate_symmetry_axis_and_end_widths(points_px)
+
+def estimate_axis_and_end_widths_for_target(points_px: np.ndarray, target: str) -> Dict:
+    # Mirror symmetry is the right orientation rule for all supported target
+    # modes. The architectural drawing simply made the weakness of the old
+    # longest-axis PCA rule more obvious.
+    #
+    # We keep the `target` argument because other parts of the pipeline still
+    # use it, but axis estimation now prefers the symmetry axis universally.
+    return estimate_symmetry_axis_and_end_widths(points_px)
 
 
 def find_best_circle_split(
@@ -1089,9 +1832,17 @@ def choose_eight_arc_boundaries(
     if abs(y_max - y_min) < 1e-9:
         raise ValueError("Profile Y span is too small for arc distribution.")
 
-    rule = rule if rule in ARC_DISTRIBUTION_OPTIONS else "Unrestricted"
+    rule = rule if rule in ARC_DISTRIBUTION_OPTIONS else "Top/bottom weighted"
 
-    if rule == "Half above midpoint":
+    if rule == "Top/bottom weighted":
+        # Denser spacing near both ends:
+        #   bottom/P8 region gets more, shorter arcs
+        #   top/P0 region gets more, shorter arcs
+        #   straighter middle gets fewer, longer arcs
+        y_targets = cosine_spaced_values(y_min, y_max, ARC_COUNT + 1)
+        boundaries = boundaries_from_y_targets(points_xy, y_targets)
+
+    elif rule == "Half above midpoint":
         split_y = (y_min + y_max) / 2.0
         lower = np.linspace(y_min, split_y, ARC_COUNT // 2 + 1)
         upper = np.linspace(split_y, y_max, ARC_COUNT // 2 + 1)[1:]
@@ -1117,20 +1868,44 @@ def choose_eight_arc_boundaries(
         )
         boundaries = [0] + breakpoints + [point_count - 1]
 
+    forced_indices = [widest_index]
+
+    # U-shape / lowered-closure helper:
+    # If the last point is on the symmetry axis but the previous point is still
+    # wide, force the previous point to be P7 / the start of Arc 8. This gives
+    # the final arc a clean leg-bottom-to-P8 closure instead of letting the
+    # boundary drift upward and create a bubble.
+    if point_count >= ARC_COUNT + 2:
+        penultimate_index = point_count - 2
+        last_is_axis = abs(float(points_xy[-1, 0])) <= 1e-9
+        previous_is_wide = abs(float(points_xy[penultimate_index, 0])) >= max(
+            1e-9,
+            float(np.max(np.abs(points_xy[:, 0]))) * 0.18,
+        )
+
+        if last_is_axis and previous_is_wide:
+            forced_indices.append(penultimate_index)
+
     boundaries = normalize_arc_boundaries(
         boundaries,
         point_count=point_count,
         required_count=ARC_COUNT + 1,
-        forced_indices=[widest_index],
+        forced_indices=forced_indices,
     )
 
-    if widest_index not in boundaries and 0 < widest_index < point_count - 1:
-        boundaries.append(widest_index)
+    missing_forced = [
+        index
+        for index in forced_indices
+        if index not in boundaries and 0 < index < point_count - 1
+    ]
+
+    for forced_index in missing_forced:
+        boundaries.append(forced_index)
         boundaries = normalize_arc_boundaries(
             boundaries,
             point_count=point_count,
             required_count=ARC_COUNT + 1,
-            forced_indices=[widest_index],
+            forced_indices=forced_indices,
         )
 
     return boundaries, widest_index
@@ -1177,12 +1952,14 @@ class ArcProfileFinderApp:
         self.close_ends_var = tk.BooleanVar(value=True)
         self.force_convex_arcs_var = tk.BooleanVar(value=True)
 
-        self.profile_target_var = tk.StringVar(value="Outer outside edge")
+        self.profile_target_var = tk.StringVar(value="Inside edge")
+        self.bottom_mode_var = tk.StringVar(value="Auto")
+        self.u_bottom_drop_px_var = tk.StringVar(value="6")
         self.lock_manual_closures_var = tk.BooleanVar(value=False)
 
         self.auto_point_count_var = tk.StringVar(value="90")
         self.auto_arc_tolerance_var = tk.StringVar(value="2.5")
-        self.arc_distribution_var = tk.StringVar(value="Unrestricted")
+        self.arc_distribution_var = tk.StringVar(value="Top/bottom weighted")
 
         self.part_length_var = tk.StringVar(value="")
         self.part_width_var = tk.StringVar(value="")
@@ -1266,6 +2043,7 @@ class ArcProfileFinderApp:
         ttk.Button(frame, text="Load Image", command=self.load_image).pack(side=tk.LEFT, padx=3)
         ttk.Button(frame, text="Auto Process All", command=self.auto_process_all).pack(side=tk.LEFT, padx=3)
         ttk.Button(frame, text="Flip Up Direction", command=self.flip_up_direction).pack(side=tk.LEFT, padx=3)
+        ttk.Button(frame, text="Rotate 90°", command=self.rotate_image_90_clockwise).pack(side=tk.LEFT, padx=3)
         ttk.Button(frame, text="Export 8-Arc CSV", command=self.export_arc_summary_csv).pack(side=tk.LEFT, padx=3)
 
         self.toggle_side_panel_button = ttk.Button(
@@ -1313,7 +2091,7 @@ class ArcProfileFinderApp:
         option visible in one horizontal row. The controls are grouped by task:
 
             Core:
-                target, profile points, arc tolerance, max arcs, closure options
+                algorithm, shape, profile points, arc tolerance, arc count, closure options
 
             Tuning:
                 edge sensitivity, outer search distance, smoothing
@@ -1348,7 +2126,10 @@ class ArcProfileFinderApp:
         row3.grid(row=2, column=0, sticky="ew", padx=4, pady=(2, 2))
 
         row4 = ttk.Frame(parent)
-        row4.grid(row=3, column=0, sticky="ew", padx=4, pady=(2, 5))
+        row4.grid(row=3, column=0, sticky="ew", padx=4, pady=(2, 2))
+
+        row5 = ttk.Frame(parent)
+        row5.grid(row=4, column=0, sticky="ew", padx=4, pady=(2, 5))
 
         ttk.Checkbutton(
             row1,
@@ -1366,25 +2147,53 @@ class ArcProfileFinderApp:
         # Manual closure locking is intentionally hidden in this build.
         # The app is auto-detection + tuning only; image clicking is disabled.
 
-        ttk.Label(row2, text="Target:").pack(side=tk.LEFT, padx=(4, 2))
-        target_combo = ttk.Combobox(
+        # Row 2: image/profile extraction controls.
+        ttk.Label(row2, text="Algorithm:").pack(side=tk.LEFT, padx=(4, 2))
+        algorithm_combo = ttk.Combobox(
             row2,
             textvariable=self.profile_target_var,
-            values=["Outer outside edge", "Inner dark opening"],
-            width=18,
+            values=["Inside edge", "Silhouette", "Drawing"],
+            width=16,
             state="readonly"
         )
-        target_combo.pack(side=tk.LEFT, padx=(0, 12))
+        algorithm_combo.pack(side=tk.LEFT, padx=(0, 12))
+
+        ttk.Label(row2, text="Shape:").pack(side=tk.LEFT, padx=(4, 2))
+        shape_combo = ttk.Combobox(
+            row2,
+            textvariable=self.bottom_mode_var,
+            values=BOTTOM_MODE_OPTIONS,
+            width=17,
+            state="readonly"
+        )
+        shape_combo.pack(side=tk.LEFT, padx=(0, 12))
+
+        ttk.Label(row2, text="U - Offset (px):").pack(side=tk.LEFT, padx=(4, 2))
+        ttk.Entry(
+            row2,
+            textvariable=self.u_bottom_drop_px_var,
+            width=6
+        ).pack(side=tk.LEFT, padx=(0, 12))
 
         ttk.Label(row2, text="Profile pts:").pack(side=tk.LEFT, padx=(8, 2))
-        ttk.Entry(row2, textvariable=self.auto_point_count_var, width=7).pack(side=tk.LEFT, padx=(0, 12))
-
-        ttk.Label(row2, text="Arc tolerance:").pack(side=tk.LEFT, padx=(8, 2))
-        ttk.Entry(row2, textvariable=self.auto_arc_tolerance_var, width=7).pack(side=tk.LEFT, padx=(0, 12))
-
-        ttk.Label(row2, text="Arc distribution:").pack(side=tk.LEFT, padx=(8, 2))
-        distribution_combo = ttk.Combobox(
+        ttk.Entry(
             row2,
+            textvariable=self.auto_point_count_var,
+            width=7
+        ).pack(side=tk.LEFT, padx=(0, 12))
+
+        # Row 3: arc-fitting controls. Keeping these on their own row prevents
+        # Arc tolerance, distribution, and count from running off-screen.
+        ttk.Label(row3, text="Arc tolerance:").pack(side=tk.LEFT, padx=(4, 2))
+        ttk.Entry(
+            row3,
+            textvariable=self.auto_arc_tolerance_var,
+            width=7
+        ).pack(side=tk.LEFT, padx=(0, 12))
+
+        ttk.Label(row3, text="Arc distribution:").pack(side=tk.LEFT, padx=(8, 2))
+        distribution_combo = ttk.Combobox(
+            row3,
             textvariable=self.arc_distribution_var,
             values=ARC_DISTRIBUTION_OPTIONS,
             width=23,
@@ -1392,17 +2201,18 @@ class ArcProfileFinderApp:
         )
         distribution_combo.pack(side=tk.LEFT, padx=(0, 12))
 
-        ttk.Label(row2, text=f"Arc count: {ARC_COUNT}").pack(side=tk.LEFT, padx=(8, 2))
+        ttk.Label(row3, text=f"Arc count: {ARC_COUNT}").pack(side=tk.LEFT, padx=(8, 2))
 
-        ttk.Label(row3, text="Part length:").pack(side=tk.LEFT, padx=(4, 2))
-        ttk.Entry(row3, textvariable=self.part_length_var, width=10).pack(side=tk.LEFT, padx=(0, 10))
+        # Row 4: optional real-world scaling.
+        ttk.Label(row4, text="Part length:").pack(side=tk.LEFT, padx=(4, 2))
+        ttk.Entry(row4, textvariable=self.part_length_var, width=10).pack(side=tk.LEFT, padx=(0, 10))
 
-        ttk.Label(row3, text="Part width:").pack(side=tk.LEFT, padx=(8, 2))
-        ttk.Entry(row3, textvariable=self.part_width_var, width=10).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(row4, text="Part width:").pack(side=tk.LEFT, padx=(8, 2))
+        ttk.Entry(row4, textvariable=self.part_width_var, width=10).pack(side=tk.LEFT, padx=(0, 10))
 
-        ttk.Label(row3, text="Units:").pack(side=tk.LEFT, padx=(8, 2))
+        ttk.Label(row4, text="Units:").pack(side=tk.LEFT, padx=(8, 2))
         units_combo = ttk.Combobox(
-            row3,
+            row4,
             textvariable=self.dimension_units_var,
             values=DIMENSION_UNIT_OPTIONS,
             width=6,
@@ -1410,9 +2220,10 @@ class ArcProfileFinderApp:
         )
         units_combo.pack(side=tk.LEFT, padx=(0, 12))
 
-        ttk.Label(row4, text="Summary units:").pack(side=tk.LEFT, padx=(4, 2))
+        # Row 5: result units and shape guidance.
+        ttk.Label(row5, text="Summary units:").pack(side=tk.LEFT, padx=(4, 2))
         summary_units_combo = ttk.Combobox(
-            row4,
+            row5,
             textvariable=self.arc_summary_units_var,
             values=ARC_SUMMARY_UNIT_OPTIONS,
             width=6,
@@ -1422,8 +2233,13 @@ class ArcProfileFinderApp:
         summary_units_combo.bind("<<ComboboxSelected>>", lambda event: self.update_results_text())
 
         ttk.Label(
-            row4,
-            text="8-Arc Summary can be shown in pixels, mm, or inches. Force convex arcs is normally best left enabled; press Auto Process All after changing it.",
+            row5,
+            text=(
+                "8-Arc Summary can be shown in pixels, mm, or inches. "
+                "For inverted-U drawings, choose U-shaped bottom and use a small "
+                "U - Offset (px). Arc 8 is axis-centered so left/right halves "
+                "close smoothly at P8."
+            ),
             foreground="gray35",
         ).pack(side=tk.LEFT, padx=(8, 2))
 
@@ -1768,7 +2584,7 @@ class ArcProfileFinderApp:
             "==================\n\n"
             "1. Load Image.\n"
             "2. Press Auto Process All when ready. Images do not auto-process on load.\n"
-            "3. Use the Tuning tab if the edge is weak, over/under-shoots, or sits a few pixels inside/outside the true edge.\n"
+            "3. Use the Tuning tab if the edge is weak, over/under-shoots, or sits a few pixels inside/outside the true edge. For Photoshop cutouts, use Algorithm = Silhouette. For catalog/architectural drawings, use Algorithm = Drawing. The symmetry-axis rule is used for drawings and regular images. Use Rotate 90° if the source drawing is still sideways. All algorithms now choose the mirror-symmetry axis first instead of blindly using the longest axis.\n"
             "4. Enter Part Length / Part Width if you need mm or inches.\n"
             "5. Arc fitting always creates 8 arcs. Force convex arcs keeps centers inward so arcs bulge outward. After changing it, press Auto Process All.\n"
             "6. Mouse wheel zoom is enabled directly on the plots.\n"
@@ -1781,12 +2597,15 @@ class ArcProfileFinderApp:
             "12. Use Export 8-Arc CSV for the compact P0-P8 / A1-A8 output.\n\n"
             "Arc distribution rules\n"
             "======================\n\n"
+            "Top/bottom weighted:\n"
+            "  Best default for teardrop / bike-post shapes. Places more, shorter arcs near P0/P8\n"
+            "  and fewer, longer arcs through the straighter middle. This helps reduce join bubbles.\n\n"
             "Half above midpoint:\n"
             "  Attempts to place 4 arcs above the vertical midpoint and 4 below it.\n\n"
             "Half above widest point:\n"
             "  Attempts to place 4 arcs above the widest point and 4 below it.\n\n"
             "Unrestricted:\n"
-            "  Uses the automatic error-based distribution behavior.\n\n"
+            "  Uses the automatic error-based distribution behavior. Can work, but may under-sample top/bottom.\n\n"
             "Tuning controls\n"
             "===============\n\n"
             "Edge sensitivity:\n"
@@ -2124,7 +2943,7 @@ class ArcProfileFinderApp:
             return
 
         try:
-            self.status_var.set("Auto-processing: finding dark opening and orienting...")
+            self.status_var.set("Auto-processing: finding target component and orienting...")
             self.root.update_idletasks()
             self.auto_orient_image_and_axis(show_errors=False)
 
@@ -2157,30 +2976,46 @@ class ArcProfileFinderApp:
             raise ValueError("No image loaded.")
 
         try:
-            component = find_main_dark_component(self.image_pil)
-            axis_info = estimate_axis_and_end_widths(component["points_px"])
+            target = self.profile_target_var.get()
+            component = find_component_for_target(self.image_pil, target)
+            axis_info = estimate_axis_and_end_widths_for_target(component["points_px"], target)
 
             major_axis = axis_info["major_axis"]
 
             theta_degrees = math.degrees(math.atan2(major_axis[1], major_axis[0]))
             rotation_degrees = theta_degrees - 90.0
 
-            rotated_image = rotate_image_pil(self.image_pil, rotation_degrees, expand=True)
+            rotation_fill_color = estimate_rotation_fill_color(self.image_pil, target)
+            rotated_image = rotate_image_pil(
+                self.image_pil,
+                rotation_degrees,
+                expand=True,
+                fill_color=rotation_fill_color,
+            )
 
-            rotated_component = find_main_dark_component(rotated_image)
-            rotated_axis_info = estimate_axis_and_end_widths(rotated_component["points_px"])
+            rotated_component = find_component_for_target(rotated_image, target)
+            rotated_axis_info = estimate_axis_and_end_widths_for_target(rotated_component["points_px"], target)
 
             used_180_flip = False
 
             # "Up" heuristic:
             # The wider end of a top-view teardrop/airfoil profile is assumed to go at the top.
-            if rotated_axis_info["bottom_width"] > rotated_axis_info["top_width"]:
-                rotated_image = rotate_image_pil(rotated_image, 180.0, expand=False)
+            #
+            # Drawings can be U-shaped or catalog-oriented, so do not
+            # auto-flip them with the wide-end rule. Use Flip Up Direction
+            # manually if needed.
+            if target != "Drawing" and rotated_axis_info["bottom_width"] > rotated_axis_info["top_width"]:
+                rotated_image = rotate_image_pil(
+                    rotated_image,
+                    180.0,
+                    expand=False,
+                    fill_color=rotation_fill_color,
+                )
                 rotation_degrees += 180.0
                 used_180_flip = True
 
-                rotated_component = find_main_dark_component(rotated_image)
-                rotated_axis_info = estimate_axis_and_end_widths(rotated_component["points_px"])
+                rotated_component = find_component_for_target(rotated_image, target)
+                rotated_axis_info = estimate_axis_and_end_widths_for_target(rotated_component["points_px"], target)
 
             self.set_image(rotated_image)
             self.clear_annotations_for_new_orientation()
@@ -2245,7 +3080,7 @@ class ArcProfileFinderApp:
         target = self.profile_target_var.get()
 
         try:
-            component = find_main_dark_component(self.image_pil)
+            component = find_component_for_target(self.image_pil, target)
             component_points = component["points_px"]
 
             if target == "Outer outside edge":
@@ -2254,6 +3089,8 @@ class ArcProfileFinderApp:
                     requested_points=requested_points,
                 )
             else:
+                # Inside edge, Silhouette, and Drawing use the
+                # detected component itself as the outline to sample.
                 right_profile_xy, left_profile_xy, average_profile_xy = self.extract_symmetric_profile_triplet_from_component(
                     component_points,
                     requested_points=requested_points,
@@ -2745,6 +3582,393 @@ class ArcProfileFinderApp:
 
         return self.build_profile_triplet_from_half_widths(right_half, target_y_new, left_half)
 
+    def get_u_bottom_drop_px(self) -> float:
+        """
+        User-controlled amount to lower P8 for U-shaped bottom mode.
+
+        0 disables the artificial lowered P8 behavior.
+        """
+        return self.safe_float_from_var(
+            self.u_bottom_drop_px_var,
+            default=6.0,
+            minimum=0.0,
+            maximum=250.0,
+        )
+
+    def should_use_u_shape_bottom_closure(
+        self,
+        target: str,
+        close_ends: bool,
+        right_arr: np.ndarray,
+        left_arr: np.ndarray,
+    ) -> bool:
+        """
+        Decide whether to use the U-shaped bottom closure.
+
+        Shape:
+            Standard closed   -> never use U closure
+            U-shaped bottom   -> always use U closure when close_ends is on
+            Auto              -> try to infer from measured bottom width
+
+        U-shaped bottom is useful for inverted-U architectural drawings where
+        the bottom of each leg should become P7 and P8 should sit slightly below
+        on the symmetry axis, giving Arc 8 room to close without a bubble.
+        """
+        if not close_ends:
+            return False
+
+        mode = self.bottom_mode_var.get()
+        if mode not in BOTTOM_MODE_OPTIONS:
+            mode = "Auto"
+            self.bottom_mode_var.set(mode)
+
+        if mode == "Standard closed":
+            return False
+
+        if mode == "U-shaped bottom":
+            return self.get_u_bottom_drop_px() > 0.0
+
+        # Auto mode: only infer this for drawing outlines. For normal photos and
+        # silhouettes, the standard closed assumption is usually safer.
+        if target != "Drawing":
+            return False
+
+        if right_arr is None or left_arr is None or len(right_arr) < 8 or len(left_arr) < 8:
+            return False
+
+        max_half_width = max(float(np.max(right_arr)), float(np.max(left_arr)), 1e-9)
+        bottom_half_width = max(float(right_arr[-1]), float(left_arr[-1]))
+        top_half_width = max(float(right_arr[0]), float(left_arr[0]))
+
+        bottom_ratio = bottom_half_width / max_half_width
+        top_ratio = top_half_width / max_half_width
+
+        # U-like drawings stay wide at the bottom legs. Normal closed/teardrop
+        # profiles should be narrow at the bottom.
+        return bottom_ratio >= 0.18 and bottom_ratio > top_ratio * 1.10
+
+    def find_u_shape_side_bottom_points_from_raw_profile(
+        self,
+        x_values: np.ndarray,
+        y_values: np.ndarray,
+        y_arr: np.ndarray,
+        right_arr: np.ndarray,
+        left_arr: np.ndarray,
+    ) -> Tuple[float, float, float, float]:
+        """
+        Find independent right/left P7 bottom-leg points from raw pixels.
+
+        Returns:
+            right_p7_y, right_p7_half_width, left_p7_y, left_p7_half_width
+
+        This is more precise than forcing both sides to share one Y row. On
+        U-shaped drawings, the true lowest point of the right leg and left leg
+        can differ by a few pixels due to scan quality, line thickness, or slight
+        asymmetry. Each side should get its own P7 at its own lowest outside
+        point.
+        """
+        x_values = np.asarray(x_values, dtype=float)
+        y_values = np.asarray(y_values, dtype=float)
+        y_arr = np.asarray(y_arr, dtype=float)
+        right_arr = np.asarray(right_arr, dtype=float)
+        left_arr = np.asarray(left_arr, dtype=float)
+
+        fallback_index = self.find_u_shape_bottom_leg_row(y_arr, right_arr, left_arr)
+        fallback_y = float(y_arr[fallback_index])
+        fallback_right = float(right_arr[fallback_index])
+        fallback_left = float(left_arr[fallback_index])
+
+        if len(x_values) < 10 or len(y_values) < 10 or len(x_values) != len(y_values):
+            return fallback_y, fallback_right, fallback_y, fallback_left
+
+        max_half_width = max(float(np.max(right_arr)), float(np.max(left_arr)), 1e-9)
+
+        y_min = float(np.min(y_values))
+        y_max = float(np.max(y_values))
+        y_span = max(y_max - y_min, 1e-9)
+
+        lower_mask = y_values >= (y_min + y_span * 0.66)
+
+        # Outside threshold is intentionally low enough to catch the bottom
+        # curve as it turns inward, but high enough to ignore the internal U
+        # detail near the symmetry axis.
+        outside_threshold = max_half_width * 0.08
+
+        right_mask = lower_mask & (x_values >= outside_threshold)
+        left_mask = lower_mask & (x_values <= -outside_threshold)
+
+        def side_bottom(mask: np.ndarray, side: str) -> Tuple[float, float]:
+            if int(np.count_nonzero(mask)) == 0:
+                if side == "right":
+                    return fallback_y, fallback_right
+                return fallback_y, fallback_left
+
+            side_y = y_values[mask]
+            side_x = x_values[mask]
+
+            max_y = float(np.max(side_y))
+
+            # Use a tight bottom band so we pick the lower edge of the thick
+            # black/drawing line, not the upper edge.
+            px_scale = max(float(self.scale_per_px), 1e-12)
+            band = max(2.0 * px_scale, y_span * 0.004)
+            bottom_band = side_y >= (max_y - band)
+
+            if int(np.count_nonzero(bottom_band)) == 0:
+                bottom_band = side_y >= max_y
+
+            bottom_x = side_x[bottom_band]
+            bottom_y = side_y[bottom_band]
+
+            if len(bottom_x) == 0:
+                if side == "right":
+                    return fallback_y, fallback_right
+                return fallback_y, fallback_left
+
+            # For the right side use the outermost positive x in the bottom
+            # band. For the left side use the outermost negative x magnitude.
+            # This gives P7 a real outside-leg width at the lowest row.
+            if side == "right":
+                half_width = max(0.0, float(np.percentile(bottom_x, 95.0)))
+            else:
+                half_width = max(0.0, -float(np.percentile(bottom_x, 5.0)))
+
+            y_pick = float(np.max(bottom_y))
+
+            # Guard against accidentally snapping to a tiny internal detail.
+            if half_width < max_half_width * 0.08:
+                if side == "right":
+                    return fallback_y, fallback_right
+                return fallback_y, fallback_left
+
+            return y_pick, half_width
+
+        right_y, right_half = side_bottom(right_mask, "right")
+        left_y, left_half = side_bottom(left_mask, "left")
+
+        return float(right_y), float(right_half), float(left_y), float(left_half)
+
+    def find_u_shape_bottom_leg_geometry_from_raw_profile(
+        self,
+        x_values: np.ndarray,
+        y_values: np.ndarray,
+        y_arr: np.ndarray,
+        right_arr: np.ndarray,
+        left_arr: np.ndarray,
+    ) -> Tuple[float, float, float]:
+        """
+        Find the U-bottom P7 location from raw detected component points.
+
+        Returns:
+            bottom_leg_y, bottom_right_half, bottom_left_half
+
+        This is more accurate than using the smoothed binned arrays because the
+        bottom of a drawing line can be only a few pixels tall. Smoothing can
+        easily pull the selected row upward, which is exactly what caused P7 to
+        sit close to the bottom but not on it.
+        """
+        x_values = np.asarray(x_values, dtype=float)
+        y_values = np.asarray(y_values, dtype=float)
+        y_arr = np.asarray(y_arr, dtype=float)
+        right_arr = np.asarray(right_arr, dtype=float)
+        left_arr = np.asarray(left_arr, dtype=float)
+
+        if len(x_values) < 10 or len(y_values) < 10:
+            fallback_index = self.find_u_shape_bottom_leg_row(y_arr, right_arr, left_arr)
+            return (
+                float(y_arr[fallback_index]),
+                float(right_arr[fallback_index]),
+                float(left_arr[fallback_index]),
+            )
+
+        if len(x_values) != len(y_values):
+            fallback_index = self.find_u_shape_bottom_leg_row(y_arr, right_arr, left_arr)
+            return (
+                float(y_arr[fallback_index]),
+                float(right_arr[fallback_index]),
+                float(left_arr[fallback_index]),
+            )
+
+        max_half_width = max(float(np.max(right_arr)), float(np.max(left_arr)), 1e-9)
+
+        y_min = float(np.min(y_values))
+        y_max = float(np.max(y_values))
+        y_span = max(y_max - y_min, 1e-9)
+
+        # Work only in the lower portion of the detected profile.
+        lower_mask = y_values >= (y_min + y_span * 0.68)
+
+        # Ignore points too close to the symmetry axis. Those are usually the
+        # inner U detail, centerline noise, or constructed closure behavior.
+        outside_threshold = max_half_width * 0.10
+
+        right_mask = lower_mask & (x_values >= outside_threshold)
+        left_mask = lower_mask & (x_values <= -outside_threshold)
+
+        if int(np.count_nonzero(right_mask)) == 0 or int(np.count_nonzero(left_mask)) == 0:
+            fallback_index = self.find_u_shape_bottom_leg_row(y_arr, right_arr, left_arr)
+            return (
+                float(y_arr[fallback_index]),
+                float(right_arr[fallback_index]),
+                float(left_arr[fallback_index]),
+            )
+
+        right_bottom_y = float(np.max(y_values[right_mask]))
+        left_bottom_y = float(np.max(y_values[left_mask]))
+
+        # Shared profile-Y coordinate for the P7 pair. Use the lowest side found.
+        bottom_leg_y = max(right_bottom_y, left_bottom_y)
+
+        # Use a narrow band around the bottom to get robust left/right extents.
+        # A line drawing may only have a few pixels in the exact row, so allow
+        # a small band but keep it tight enough not to drift upward.
+        px_scale = max(float(self.scale_per_px), 1e-12)
+        band = max(2.5 * px_scale, y_span * 0.006)
+
+        band_mask = (y_values >= bottom_leg_y - band) & (y_values <= bottom_leg_y + band)
+        right_band = band_mask & (x_values >= outside_threshold)
+        left_band = band_mask & (x_values <= -outside_threshold)
+
+        # If the shared row is slightly below one side, widen the band once.
+        if int(np.count_nonzero(right_band)) < 2 or int(np.count_nonzero(left_band)) < 2:
+            band = max(5.0 * px_scale, y_span * 0.012)
+            band_mask = (y_values >= bottom_leg_y - band) & (y_values <= bottom_leg_y + band)
+            right_band = band_mask & (x_values >= outside_threshold)
+            left_band = band_mask & (x_values <= -outside_threshold)
+
+        if int(np.count_nonzero(right_band)) >= 2:
+            bottom_right_half = max(0.0, float(np.percentile(x_values[right_band], 98.0)))
+        else:
+            bottom_right_half = float(np.interp(bottom_leg_y, y_arr, right_arr))
+
+        if int(np.count_nonzero(left_band)) >= 2:
+            bottom_left_half = max(0.0, -float(np.percentile(x_values[left_band], 2.0)))
+        else:
+            bottom_left_half = float(np.interp(bottom_leg_y, y_arr, left_arr))
+
+        # Guard against accidentally snapping to an internal detail. The bottom
+        # leg should still have meaningful outside width.
+        if max(bottom_right_half, bottom_left_half) < max_half_width * 0.12:
+            fallback_index = self.find_u_shape_bottom_leg_row(y_arr, right_arr, left_arr)
+            return (
+                float(y_arr[fallback_index]),
+                float(right_arr[fallback_index]),
+                float(left_arr[fallback_index]),
+            )
+
+        return float(bottom_leg_y), float(bottom_right_half), float(bottom_left_half)
+
+    def find_u_shape_bottom_leg_row(
+        self,
+        y_arr: np.ndarray,
+        right_arr: np.ndarray,
+        left_arr: np.ndarray,
+    ) -> int:
+        """
+        Return the sample-row index that should become P7 for U-shaped drawings.
+
+        The goal is not merely "last row"; it is the lowest row that still
+        represents the outside legs of the U. This helps when the detector has
+        small lower artifacts, closure construction, or linework that makes the
+        final automatic boundary land slightly high.
+
+        Heuristic:
+            - look in the lower portion of the profile
+            - require the outside width to still be meaningful
+            - choose the largest Y row that passes
+        """
+        y_arr = np.asarray(y_arr, dtype=float)
+        right_arr = np.asarray(right_arr, dtype=float)
+        left_arr = np.asarray(left_arr, dtype=float)
+
+        if len(y_arr) == 0:
+            return 0
+
+        if len(y_arr) != len(right_arr) or len(y_arr) != len(left_arr):
+            return max(0, len(y_arr) - 1)
+
+        half_width = np.maximum(np.abs(right_arr), np.abs(left_arr))
+        max_half_width = float(np.max(half_width)) if len(half_width) else 0.0
+
+        if max_half_width <= 1e-9:
+            return max(0, len(y_arr) - 1)
+
+        y_min = float(np.min(y_arr))
+        y_max = float(np.max(y_arr))
+        y_span = max(y_max - y_min, 1e-9)
+
+        # Candidate rows in the lower region that are still wide enough to be
+        # the bottom of the U leg rather than the center closure.
+        lower_region = y_arr >= (y_min + y_span * 0.70)
+        wide_enough = half_width >= max_half_width * 0.14
+
+        candidates = np.where(lower_region & wide_enough)[0]
+
+        if len(candidates) == 0:
+            # Fallback: use the lower-most row with a meaningful width.
+            candidates = np.where(half_width >= max_half_width * 0.10)[0]
+
+        if len(candidates) == 0:
+            return max(0, len(y_arr) - 1)
+
+        # Pick the largest Y coordinate. If several rows are tied/noisy, this
+        # naturally chooses the bottom-most detected outside-leg point.
+        best_local = int(candidates[np.argmax(y_arr[candidates])])
+        return best_local
+
+    def u_shape_bottom_extension(
+        self,
+        axis_length: float,
+        right_arr: np.ndarray,
+        left_arr: np.ndarray,
+    ) -> float:
+        """
+        Amount to lower P8 for U-shaped drawings.
+
+        Earlier builds used a large automatic extension, which made the final
+        contour visibly stop fitting the drawing. This version uses the explicit
+        U - Offset (px) field so the user can keep the closure subtle.
+        """
+        mode = self.bottom_mode_var.get()
+
+        if mode == "U-shaped bottom":
+            drop_px = self.get_u_bottom_drop_px()
+            return float(drop_px) * float(self.scale_per_px)
+
+        # Auto mode fallback: conservative, small drop only.
+        max_half_width = max(float(np.max(right_arr)), float(np.max(left_arr)), 1e-9)
+        bottom_half_width = max(float(right_arr[-1]), float(left_arr[-1]))
+
+        extension = max(
+            4.0 * self.scale_per_px,
+            min(axis_length * 0.025, bottom_half_width * 0.10),
+        )
+
+        extension = min(extension, max(axis_length * 0.055, 10.0 * self.scale_per_px))
+
+        return float(max(extension, 0.0))
+
+    def extend_axis_bottom_to_profile_y(self, closure_y: float):
+        """
+        Extend the currently detected symmetry axis bottom to a new profile-Y
+        position while keeping the same top point and axis direction.
+        """
+        if len(self.axis_points_px) != 2:
+            return
+
+        top, bottom, axis_dir, axis_perp, axis_length_px = self.axis_basis()
+
+        if axis_length_px <= 1e-9:
+            return
+
+        closure_y_px = float(closure_y) / max(float(self.scale_per_px), 1e-12)
+
+        if closure_y_px <= axis_length_px:
+            return
+
+        new_bottom = top + axis_dir * closure_y_px
+        self.axis_points_px = [np.array(top, dtype=float), np.array(new_bottom, dtype=float)]
+
     def extract_symmetric_profile_triplet_from_component(
         self,
         component_points_px: np.ndarray,
@@ -2822,35 +4046,138 @@ class ArcProfileFinderApp:
             raise ValueError("Could not estimate profile width.")
 
         close_ends = bool(self.close_ends_var.get())
+        target = self.profile_target_var.get()
+
+        # This app intentionally models the OUTER profile/envelope.
+        #
+        # For U-shaped drawings, do not follow the inside return of the U.
+        # Instead, keep the second-to-last point at the lowest outside leg of the
+        # U, then lower P8 on the symmetry axis so Arc 8 can close cleanly.
+        use_u_bottom_closure = self.should_use_u_shape_bottom_closure(
+            target,
+            close_ends,
+            right_arr,
+            left_arr,
+        )
 
         if close_ends:
-            source_y = np.concatenate([np.array([0.0]), y_arr, np.array([axis_length])])
-            right_source = np.concatenate([np.array([0.0]), right_arr, np.array([0.0])])
-            left_source = np.concatenate([np.array([0.0]), left_arr, np.array([0.0])])
+            source_y = np.concatenate([np.array([0.0]), y_arr])
+            right_source = np.concatenate([np.array([0.0]), right_arr])
+            left_source = np.concatenate([np.array([0.0]), left_arr])
 
-            source_order = np.argsort(source_y)
-            source_y = source_y[source_order]
-            right_source = right_source[source_order]
-            left_source = left_source[source_order]
+            bottom_leg_y = float(y_arr[-1])
 
-            unique_y, unique_indices = np.unique(source_y, return_index=True)
-            source_y = unique_y
-            right_source = right_source[unique_indices]
-            left_source = left_source[unique_indices]
+            if use_u_bottom_closure:
+                right_p7_y, right_p7_half, left_p7_y, left_p7_half = self.find_u_shape_side_bottom_points_from_raw_profile(
+                    x_values,
+                    y_values,
+                    y_arr,
+                    right_arr,
+                    left_arr,
+                )
 
-            target_y = cosine_spaced_values(0.0, axis_length, requested_points)
-            right_half = np.interp(target_y, source_y, right_source)
-            left_half = np.interp(target_y, source_y, left_source)
-            right_half[0] = 0.0
-            right_half[-1] = 0.0
-            left_half[0] = 0.0
-            left_half[-1] = 0.0
+                # P8 is below the lower of the two side-specific P7 points.
+                deepest_p7_y = max(float(right_p7_y), float(left_p7_y))
+
+                closure_extension = self.u_shape_bottom_extension(
+                    axis_length,
+                    right_arr,
+                    left_arr,
+                )
+                closure_y = deepest_p7_y + closure_extension
+
+                # Build right and left profiles independently so each side's
+                # penultimate point can be exactly at that side's lowest P7.
+                #
+                # We keep target_y as the right-side Y chain for compatibility,
+                # but overwrite the left profile's penultimate Y after building
+                # the left profile array. The downstream left/right arrays are
+                # allowed to have their own Y values.
+                right_target_y = cosine_spaced_values(0.0, float(right_p7_y), max(requested_points - 1, 9))
+                right_half = np.interp(right_target_y, source_y, right_source)
+
+                left_target_y = cosine_spaced_values(0.0, float(left_p7_y), max(requested_points - 1, 9))
+                left_half = np.interp(left_target_y, source_y, left_source)
+
+                right_target_y[0] = 0.0
+                left_target_y[0] = 0.0
+                right_half[0] = 0.0
+                left_half[0] = 0.0
+
+                # Force each side's P7 to that side's lowest outside-leg point.
+                right_target_y[-1] = float(right_p7_y)
+                left_target_y[-1] = float(left_p7_y)
+                right_half[-1] = float(right_p7_half)
+                left_half[-1] = float(left_p7_half)
+
+                right_target_y = np.concatenate([right_target_y, np.array([closure_y])])
+                left_target_y = np.concatenate([left_target_y, np.array([closure_y])])
+
+                right_half = np.concatenate([right_half, np.array([0.0])])
+                left_half = np.concatenate([left_half, np.array([0.0])])
+
+                # Build directly here because left and right now have different
+                # penultimate Y coordinates.
+                right_xy = np.column_stack([right_half, right_target_y])
+                left_xy = np.column_stack([-left_half, left_target_y])
+
+                average_half = 0.5 * (np.abs(right_half) + np.abs(left_half))
+                average_y = 0.5 * (right_target_y + left_target_y)
+                average_xy = np.column_stack([average_half, average_y])
+
+                self.extend_axis_bottom_to_profile_y(closure_y)
+
+                # Apply edge offset below using these direct arrays.
+                target_y = right_target_y
+            else:
+                source_y = np.concatenate([source_y, np.array([axis_length])])
+                right_source = np.concatenate([right_source, np.array([0.0])])
+                left_source = np.concatenate([left_source, np.array([0.0])])
+
+                source_order = np.argsort(source_y)
+                source_y = source_y[source_order]
+                right_source = right_source[source_order]
+                left_source = left_source[source_order]
+
+                unique_y, unique_indices = np.unique(source_y, return_index=True)
+                source_y = unique_y
+                right_source = right_source[unique_indices]
+                left_source = left_source[unique_indices]
+
+                target_y = cosine_spaced_values(0.0, axis_length, requested_points)
+                right_half = np.interp(target_y, source_y, right_source)
+                left_half = np.interp(target_y, source_y, left_source)
+
+                right_half[0] = 0.0
+                right_half[-1] = 0.0
+                left_half[0] = 0.0
+                left_half[-1] = 0.0
+
+            if use_u_bottom_closure:
+                # Apply offsets to the independent U-mode arrays while keeping
+                # the explicit P8 closure exact.
+                right_xy[:, 0] = self.apply_edge_offset_to_half_widths(right_xy[:, 0], close_ends=True)
+                left_xy[:, 0] = -self.apply_edge_offset_to_half_widths(np.abs(left_xy[:, 0]), close_ends=True)
+
+                right_xy[0, 0] = 0.0
+                right_xy[-1, 0] = 0.0
+                left_xy[0, 0] = 0.0
+                left_xy[-1, 0] = 0.0
+
+                # Recompute the average from the final adjusted sides.
+                average_half = 0.5 * (np.abs(right_xy[:, 0]) + np.abs(left_xy[:, 0]))
+                average_y = 0.5 * (right_xy[:, 1] + left_xy[:, 1])
+                average_xy = np.column_stack([average_half, average_y])
+
+                return right_xy, left_xy, average_xy
+
             right_half = self.apply_edge_offset_to_half_widths(right_half, close_ends=True)
             left_half = self.apply_edge_offset_to_half_widths(left_half, close_ends=True)
         else:
             target_y = np.linspace(float(y_arr[0]), float(y_arr[-1]), requested_points)
             right_half = np.interp(target_y, y_arr, right_arr)
             left_half = np.interp(target_y, y_arr, left_arr)
+
             right_half = self.apply_edge_offset_to_half_widths(right_half, close_ends=False)
             left_half = self.apply_edge_offset_to_half_widths(left_half, close_ends=False)
 
@@ -2874,7 +4201,7 @@ class ArcProfileFinderApp:
 
         distribution_rule = self.arc_distribution_var.get()
         if distribution_rule not in ARC_DISTRIBUTION_OPTIONS:
-            distribution_rule = "Unrestricted"
+            distribution_rule = "Top/bottom weighted"
             self.arc_distribution_var.set(distribution_rule)
 
         min_points = max(3, int(len(self.profile_points_px) / max(ARC_COUNT * 2, 1)))
@@ -2933,6 +4260,37 @@ class ArcProfileFinderApp:
 
         return transformed
 
+    def rotate_image_90_clockwise(self):
+        """
+        Manually rotate the current image 90 degrees clockwise.
+
+        This is useful for catalog drawings where the source image is sideways
+        or the automatic drawing-orientation pass still chooses the wrong
+        quarter-turn. It clears derived annotations; press Auto Process All
+        afterward.
+        """
+        if self.image_pil is None:
+            messagebox.showwarning("No image", "Load an image first.")
+            return
+
+        target = self.profile_target_var.get()
+        rotation_fill_color = estimate_rotation_fill_color(self.image_pil, target)
+
+        self.set_image(rotate_image_pil(
+            self.image_pil,
+            -90.0,
+            expand=True,
+            fill_color=rotation_fill_color,
+        ))
+
+        self.clear_annotations_for_new_orientation()
+
+        self.image_rotation_degrees -= 90.0
+        self.update_axis_scale_info()
+        self.update_results_text()
+        self.redraw()
+        self.status_var.set("Rotated image 90° clockwise. Press Auto Process All to detect the axis/profile.")
+
     def flip_up_direction(self):
         if self.image_pil is None:
             messagebox.showwarning("No image", "Load an image first.")
@@ -2940,7 +4298,14 @@ class ArcProfileFinderApp:
 
         width, height = self.image_pil.size
 
-        self.set_image(rotate_image_pil(self.image_pil, 180.0, expand=False))
+        target = self.profile_target_var.get()
+        rotation_fill_color = estimate_rotation_fill_color(self.image_pil, target)
+        self.set_image(rotate_image_pil(
+            self.image_pil,
+            180.0,
+            expand=False,
+            fill_color=rotation_fill_color,
+        ))
 
         transformed_axis = self.transform_points_180(self.axis_points_px, width, height)
 
@@ -3395,6 +4760,110 @@ class ArcProfileFinderApp:
             "Force convex arcs changed. Press Auto Process All to refit arcs."
         )
 
+    def apply_endpoint_tangent_bias_to_arc(
+        self,
+        segment_points: np.ndarray,
+        center: np.ndarray,
+        radius: float,
+    ) -> Tuple[np.ndarray, float]:
+        """
+        Reduce closure bubbles near P0/P8.
+
+        For mirrored profiles, the left and right final arcs should meet at the
+        center-axis closure point with the same tangent. In profile coordinates,
+        that means the tangent at P0/P8 should be horizontal across the shape.
+
+        The way to force that with a circular arc is to put the circle center on
+        the symmetry axis:
+
+            center_x = 0
+
+        Then the radius at P0/P8 is vertical and the tangent is horizontal. This
+        lets the left P7 -> P8 -> right P7 connection behave like one smooth
+        bottom arc instead of two arcs that bubble or pinch at the join.
+        """
+        if not bool(self.close_ends_var.get()):
+            return center, radius
+
+        if len(segment_points) < 2:
+            return center, radius
+
+        points = np.asarray(segment_points, dtype=float)
+        p_start = points[0]
+        p_end = points[-1]
+
+        axis_epsilon = max(1e-6, float(self.scale_per_px) * 0.75)
+
+        start_on_axis = abs(float(p_start[0])) <= axis_epsilon
+        end_on_axis = abs(float(p_end[0])) <= axis_epsilon
+
+        if not start_on_axis and not end_on_axis:
+            return center, radius
+
+        closure_point = p_start if start_on_axis else p_end
+        other_point = p_end if start_on_axis else p_start
+
+        # If the neighboring point is also on the axis, this segment is
+        # degenerate and should be left alone.
+        if abs(float(other_point[0] - closure_point[0])) <= axis_epsilon:
+            return center, radius
+
+        x0, y0 = float(closure_point[0]), float(closure_point[1])
+        x1, y1 = float(other_point[0]), float(other_point[1])
+
+        # We want center_x on the symmetry axis. In the profile coordinate
+        # system, the symmetry axis is X = 0.
+        center_x = 0.0
+
+        # Solve for center_y of a circle through:
+        #   closure point (x0 ~= 0, y0)
+        #   other point   (x1,      y1)
+        #
+        # With center = (0, cy):
+        #   x1^2 + (y1 - cy)^2 = (y0 - cy)^2
+        #
+        # Rearranged:
+        #   cy = (x1^2 + y1^2 - y0^2) / (2 * (y1 - y0))
+        denom = 2.0 * (y1 - y0)
+
+        if abs(denom) <= 1e-12:
+            return center, radius
+
+        center_y = ((x1 * x1) + (y1 * y1) - (y0 * y0)) / denom
+        biased_center = np.array([center_x, center_y], dtype=float)
+        biased_radius = float(abs(y0 - center_y))
+
+        if not np.isfinite(biased_radius) or biased_radius <= 1e-9:
+            return center, radius
+
+        # U-shaped bottom mode intentionally creates a constructed final arc,
+        # usually with only P7 and P8 in the final segment. For that mode, the
+        # axis-centered closure is the intended shape, so apply it directly.
+        mode = self.bottom_mode_var.get() if hasattr(self, "bottom_mode_var") else "Auto"
+        if mode == "U-shaped bottom":
+            return biased_center, biased_radius
+
+        # For normal shapes, only apply the bias if it does not make the fit
+        # wildly worse.
+        try:
+            old_distances = np.linalg.norm(points - center, axis=1)
+            old_radius = float(radius)
+            old_errors = old_distances - old_radius
+            old_rms = float(np.sqrt(np.mean(old_errors * old_errors)))
+
+            new_distances = np.linalg.norm(points - biased_center, axis=1)
+            new_errors = new_distances - biased_radius
+            new_rms = float(np.sqrt(np.mean(new_errors * new_errors)))
+
+            # Allow a bit more RMS error to get a cleaner mirrored closure.
+            if new_rms <= max(old_rms * 1.75, old_rms + 2.0 * self.scale_per_px):
+                return biased_center, biased_radius
+        except Exception:
+            pass
+
+        return center, radius
+
+
     def fit_circle_with_convex_preference(self, segment_points: np.ndarray):
         """
         Fit an endpoint-constrained circular arc.
@@ -3447,6 +4916,18 @@ class ArcProfileFinderApp:
             distances = np.linalg.norm(segment_points - center, axis=1)
             errors = distances - radius
 
+        biased_center, biased_radius = self.apply_endpoint_tangent_bias_to_arc(
+            segment_points,
+            center,
+            radius,
+        )
+
+        if not np.allclose(biased_center, center) or abs(float(biased_radius) - float(radius)) > 1e-12:
+            center = biased_center
+            radius = biased_radius
+            distances = np.linalg.norm(segment_points - center, axis=1)
+            errors = distances - radius
+
         return center, radius, errors
 
     def fit_arcs(self, show_warnings=True):
@@ -3478,7 +4959,7 @@ class ArcProfileFinderApp:
         )
         distribution_rule = self.arc_distribution_var.get()
         if distribution_rule not in ARC_DISTRIBUTION_OPTIONS:
-            distribution_rule = "Unrestricted"
+            distribution_rule = "Top/bottom weighted"
             self.arc_distribution_var.set(distribution_rule)
 
         min_points = max(3, int(len(self.profile_points_px) / max(ARC_COUNT * 2, 1)))
